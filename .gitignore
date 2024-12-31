@@ -1,0 +1,7 @@
+env
+deep_sort_pytorch
+traffic
+runs
+*.png
+*.pt
+*.mp4
