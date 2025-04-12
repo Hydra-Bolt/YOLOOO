@@ -22,9 +22,9 @@ from collections import deque
 import numpy as np
 palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
 data_deque = {}
-unique_track_ids = set()
 
 deepsort = None
+person_count = 0  # Global variable to count persons
 
 def init_tracker():
     global deepsort
@@ -121,53 +121,60 @@ def UI_box(x, img, color=None, label=None, line_thickness=None):
 
         cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
 
+track_id_map = {}
+tracked_ids = set()
+next_id_number = 0
 
-
-def draw_boxes(img, bbox, names,object_id, identities=None, offset=(0, 0)):
-    #cv2.line(img, line[0], line[1], (46,162,112), 3)
+def draw_boxes(img, bbox, names, object_id, identities=None, offset=(0, 0)):
+    global person_count
+    global data_deque
+    global track_id_map
+    global next_id_number
+    global tracked_ids
 
     height, width, _ = img.shape
-    # remove tracked point from buffer if object is lost
+
+    # Remove stale IDs
     for key in list(data_deque):
-      if key not in identities:
-        data_deque.pop(key)
+        if identities is not None and key not in identities:
+            data_deque.pop(key)
+            if key in tracked_ids:
+                tracked_ids.remove(key)
 
     for i, box in enumerate(bbox):
-        x1, y1, x2, y2 = [int(i) for i in box]
-        x1 += offset[0]
-        x2 += offset[0]
-        y1 += offset[1]
-        y2 += offset[1]
+        x1, y1, x2, y2 = [int(v) for v in box]
+        x1 += offset[0]; x2 += offset[0]
+        y1 += offset[1]; y2 += offset[1]
+        center = (int((x2 + x1) / 2), y2)
 
-        # code to find center of bottom edge
-        center = (int((x2+x1)/ 2), int((y2+y2)/2))
+        original_id = int(identities[i]) if identities is not None else 0
+        if original_id not in track_id_map:
+            next_id_number += 1
+            track_id_map[original_id] = next_id_number
+        new_id = track_id_map[original_id]
 
-        # get ID of object
-        id = int(identities[i]) if identities is not None else 0
+        if new_id not in data_deque:
+            data_deque[new_id] = deque(maxlen=64)
+        data_deque[new_id].appendleft(center)
 
-        # add unique id to set
-        unique_track_ids.add(id)
-        # create new buffer for new object
-        if id not in data_deque:  
-          data_deque[id] = deque(maxlen= 64)
+        # Track this ID
+        if new_id not in tracked_ids:
+            tracked_ids.add(new_id)
+
         color = compute_color_for_labels(object_id[i])
-        obj_name = names[object_id[i]]
-        label = '{}{:d}'.format("", id) + ":"+ '%s' % (obj_name)
-
-        # add center to buffer
-        data_deque[id].appendleft(center)
+        label = f"{new_id}:{names[object_id[i]]}"
         UI_box(box, img, label=label, color=color, line_thickness=2)
-        # draw trail
-        for i in range(1, len(data_deque[id])):
-            # check if on buffer value is none
-            if data_deque[id][i - 1] is None or data_deque[id][i] is None:
-                continue
-            # generate dynamic thickness of trails
-            thickness = int(np.sqrt(64 / float(i + i)) * 1.5)
-            # draw trails
-            cv2.line(img, data_deque[id][i - 1], data_deque[id][i], color, thickness)
-    return img
 
+        # Draw motion trails
+        for j in range(1, len(data_deque[new_id])):
+            if data_deque[new_id][j - 1] and data_deque[new_id][j]:
+                thickness = int(np.sqrt(64 / float(j + j)) * 1.5)
+                cv2.line(img, data_deque[new_id][j - 1], data_deque[new_id][j], color, thickness)
+
+    person_count = len(tracked_ids)
+    cv2.putText(img, f'Person Count: {person_count}', (10, 30),
+                cv2.FONT_HERSHEY_COMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+    return img
 
 class DetectionPredictor(BasePredictor):
 
@@ -179,7 +186,7 @@ class DetectionPredictor(BasePredictor):
         img = img.half() if self.model.fp16 else img.float()  # uint8 to fp16/32
         img /= 255  # 0 - 255 to 0.0 - 1.0
         return img
-
+    
     def postprocess(self, preds, img, orig_img):
         preds = ops.non_max_suppression(preds,
                                         self.args.conf,
@@ -190,6 +197,9 @@ class DetectionPredictor(BasePredictor):
         for i, pred in enumerate(preds):
             shape = orig_img[i].shape if self.webcam else orig_img.shape
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], shape).round()
+            
+            # Filter out only persons (class 0)
+            preds[i] = pred[pred[:, 5] == 0]
 
         return preds
 
@@ -234,17 +244,22 @@ class DetectionPredictor(BasePredictor):
             oids.append(int(cls))
         xywhs = torch.Tensor(xywh_bboxs)
         confss = torch.Tensor(confs)
-          
+            
         outputs = deepsort.update(xywhs, confss, oids, im0)
-        person_count = len(unique_track_ids)
-        log_string += f"Cars Count: {person_count} "
         
+        # # Insert a black block in the middle of the frame
+        # height, width, _ = im0.shape
+        # block_size = 100  # Size of the black block
+        # x1, y1 = width // 2 - block_size // 2, height // 2 - block_size // 2
+        # x2, y2 = width // 2 + block_size // 2, height // 2 + block_size // 2
+        # cv2.rectangle(im0, (x1, y1), (x2, y2), (0, 0, 0), -1)
+
         if len(outputs) > 0:
             bbox_xyxy = outputs[:, :4]
             identities = outputs[:, -2]
             object_id = outputs[:, -1]
             
-            draw_boxes(im0, bbox_xyxy, self.model.names, object_id,identities)
+            draw_boxes(im0, bbox_xyxy, self.model.names, object_id, identities)
 
         return log_string
 
